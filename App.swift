@@ -612,7 +612,7 @@ struct AnalyzerView: View {
 
                 Spacer()
 
-                Text(entry.time, format: .dateTime.hour().minute().second().millisecond())
+                Text(entry.time, format: .dateTime.hour().minute().second())
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
