@@ -45,6 +45,7 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
     private var pendingPeripheral: CBPeripheral?
     private var characteristics: [CBCharacteristic] = []
     private let logLimit = 3000
+    var onEntry: ((BLELogEntry) -> Void)?
 
     override init() {
         super.init()
@@ -53,10 +54,13 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
 
     func add(_ direction: String, _ detail: String, data: Data? = nil) {
         let hex = data.map { Self.hex($0) } ?? ""
-        logs.append(BLELogEntry(direction: direction, detail: detail, hex: hex))
+        let entry = BLELogEntry(direction: direction, detail: detail, hex: hex)
+        logs.append(entry)
         if logs.count > logLimit {
             logs.removeFirst(logs.count - logLimit)
         }
+        // 每条 BLE 日志（尤其 RX/TX/ACK/ERR）同步推送到已连接的 Windows 客户端。
+        onEntry?(entry)
     }
 
     static func hex(_ data: Data) -> String {
@@ -647,6 +651,15 @@ struct AnalyzerView: View {
                     }
                 }
                 bridge.onLog = { direction, message in ble.add(direction, message) }
+                ble.onEntry = { entry in
+                    bridge.sendEvent([
+                        "type": "ble_event",
+                        "time": ISO8601DateFormatter().string(from: entry.time),
+                        "direction": entry.direction,
+                        "detail": entry.detail,
+                        "hex": entry.hex
+                    ])
+                }
             }
             .onChange(of: scenePhase) { phase in
                 if phase == .background {
