@@ -1,6 +1,8 @@
 import SwiftUI
 import CoreBluetooth
 import UIKit
+import Network
+import Darwin
 
 @main
 struct D11BLEAnalyzerApp: App {
@@ -40,6 +42,7 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
+    private var pendingPeripheral: CBPeripheral?
     private var characteristics: [CBCharacteristic] = []
     private let logLimit = 3000
 
@@ -157,10 +160,26 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
     func connect(_ p: CBPeripheral) {
         stopScan()
 
-        if let old = peripheral {
-            central.cancelPeripheralConnection(old)
+        if let current = peripheral {
+            if current === p && isConnected {
+                add("SYS", "设备已经连接，无需重复连接")
+                return
+            }
+            if current !== p {
+                pendingPeripheral = p
+                add("SYS", "先释放当前设备连接，再连接新设备")
+                disconnect(reason: "切换设备，正在释放旧连接")
+                return
+            }
+            // 同一设备正在连接时不重复发起 connect。
+            add("SYS", "该设备正在连接或等待断开")
+            return
         }
 
+        beginConnect(p)
+    }
+
+    private func beginConnect(_ p: CBPeripheral) {
         peripheral = p
         p.delegate = self
         services = []
@@ -175,21 +194,24 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
         central.connect(p, options: nil)
     }
 
-    func disconnect() {
-        if let p = peripheral {
-            central.cancelPeripheralConnection(p)
+    func disconnect(reason: String = "用户主动断开") {
+        guard let p = peripheral else {
+            isConnected = false
+            connectedName = "未连接"
+            stateText = "已断开"
+            add("SYS", stateText)
+            return
         }
 
-        peripheral = nil
+        // 先取消所有通知订阅，再请求系统断开；保留 peripheral 引用，
+        // 直到 didDisconnect 回调到达，避免状态提前清空及切换设备竞态。
+        for characteristic in characteristics where characteristic.isNotifying {
+            p.setNotifyValue(false, for: characteristic)
+        }
         isConnected = false
-        connectedName = "未连接"
-        services = []
-        characteristics = []
-        characteristicRows = []
-        selectedCharacteristic = nil
-        selectedService = nil
-        stateText = "已断开"
-        add("SYS", stateText)
+        stateText = reason
+        add("SYS", "\(reason)：正在停止通知并释放 BLE 连接")
+        central.cancelPeripheralConnection(p)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect p: CBPeripheral) {
@@ -208,6 +230,15 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
     ) {
         stateText = "连接失败：\(error?.localizedDescription ?? "未知错误")"
         add("ERR", stateText)
+        if peripheral === p {
+            peripheral = nil
+            isConnected = false
+            connectedName = "未连接"
+        }
+        if let next = pendingPeripheral {
+            pendingPeripheral = nil
+            beginConnect(next)
+        }
     }
 
     func centralManager(
@@ -215,10 +246,25 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
         didDisconnectPeripheral p: CBPeripheral,
         error: Error?
     ) {
+        add("SYS", "系统已完成 BLE 断开：\(error?.localizedDescription ?? "正常断开")")
+        guard peripheral === p else { return }
+
+        p.delegate = nil
+        peripheral = nil
         isConnected = false
         connectedName = "未连接"
-        stateText = "连接已断开"
-        add("SYS", "断开连接：\(error?.localizedDescription ?? "正常断开")")
+        services = []
+        characteristics = []
+        characteristicRows = []
+        selectedCharacteristic = nil
+        selectedService = nil
+        stateText = "已断开，蓝牙连接已释放"
+
+        if let next = pendingPeripheral {
+            pendingPeripheral = nil
+            add("SYS", "旧连接已释放，开始连接下一台设备")
+            beginConnect(next)
+        }
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
@@ -362,14 +408,197 @@ final class BLEAnalyzer: NSObject, ObservableObject, CBCentralManagerDelegate, C
         }
     }
 
+    func bridgeWrite(uuid: String, hex: String) -> String {
+        guard isConnected else { return "ERROR: BLE_NOT_CONNECTED" }
+        guard let data = Self.parseHex(hex) else { return "ERROR: INVALID_HEX" }
+        guard let characteristic = characteristics.first(where: {
+            $0.uuid.uuidString.caseInsensitiveCompare(uuid) == .orderedSame
+        }) else { return "ERROR: CHARACTERISTIC_NOT_FOUND" }
+        write(data, to: characteristic)
+        return "OK: WRITE_QUEUED"
+    }
+
+    func bridgeSubscribe(uuid: String) -> String {
+        guard isConnected else { return "ERROR: BLE_NOT_CONNECTED" }
+        guard let characteristic = characteristics.first(where: {
+            $0.uuid.uuidString.caseInsensitiveCompare(uuid) == .orderedSame
+        }) else { return "ERROR: CHARACTERISTIC_NOT_FOUND" }
+        subscribe(characteristic)
+        return "OK: SUBSCRIBE_REQUESTED"
+    }
+
+    func bridgeRead(uuid: String) -> String {
+        guard isConnected else { return "ERROR: BLE_NOT_CONNECTED" }
+        guard let characteristic = characteristics.first(where: {
+            $0.uuid.uuidString.caseInsensitiveCompare(uuid) == .orderedSame
+        }) else { return "ERROR: CHARACTERISTIC_NOT_FOUND" }
+        read(characteristic)
+        return "OK: READ_REQUESTED"
+    }
+
     func clearLogs() {
         logs.removeAll()
         add("SYS", "日志已清空")
     }
 }
 
+
+final class WiFiBLEBridge: ObservableObject {
+    @Published var isRunning = false
+    @Published var status = "未启动"
+    @Published var localAddress = "请连接 Wi-Fi"
+    @Published var lastClient = "尚无电脑连接"
+
+    private var listener: NWListener?
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private let queue = DispatchQueue(label: "D11.WiFiBLEBridge")
+    var onCommand: (([String: String]) -> String)?
+    var onLog: ((String, String) -> Void)?
+
+    func start() {
+        guard !isRunning else { return }
+        do {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            let newListener = try NWListener(using: params, on: 8765)
+            listener = newListener
+            newListener.stateUpdateHandler = { [weak self] state in
+                DispatchQueue.main.async {
+                    switch state {
+                    case .ready:
+                        self?.isRunning = true
+                        self?.status = "已启动，端口 8765"
+                        self?.localAddress = Self.findWiFiIPv4() ?? "未获取到局域网 IP"
+                    case .failed(let error):
+                        self?.isRunning = false
+                        self?.status = "启动失败：\(error.localizedDescription)"
+                    case .cancelled:
+                        self?.isRunning = false
+                        self?.status = "已停止"
+                    default:
+                        break
+                    }
+                }
+            }
+            newListener.newConnectionHandler = { [weak self] connection in
+                self?.accept(connection)
+            }
+            newListener.start(queue: queue)
+            status = "正在启动…"
+        } catch {
+            status = "启动失败：\(error.localizedDescription)"
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        for connection in connections.values { connection.cancel() }
+        connections.removeAll()
+        DispatchQueue.main.async {
+            self.isRunning = false
+            self.status = "已停止"
+            self.lastClient = "尚无电脑连接"
+        }
+    }
+
+    func sendEvent(_ object: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object),
+              let text = String(data: data, encoding: .utf8) else { return }
+        let payload = Data((text + "\n").utf8)
+        queue.async {
+            for connection in self.connections.values {
+                connection.send(content: payload, completion: .contentProcessed { _ in })
+            }
+        }
+    }
+
+    private func accept(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        connections[key] = connection
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection else { return }
+            if case .ready = state {
+                DispatchQueue.main.async {
+                    self.lastClient = "Windows 已连接"
+                    self.onLog?("SYS", "Windows 客户端已连接到 Wi-Fi 蓝牙桥接")
+                }
+                self.receiveLine(connection, key: key, buffer: Data())
+            } else {
+                switch state {
+                case .failed, .cancelled:
+                    self.connections.removeValue(forKey: key)
+                    DispatchQueue.main.async {
+                        self.lastClient = self.connections.isEmpty ? "尚无电脑连接" : "Windows 已连接"
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func receiveLine(_ connection: NWConnection, key: ObjectIdentifier, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+            var pending = buffer
+            if let data { pending.append(data) }
+
+            while let newline = pending.firstIndex(of: 10) {
+                let line = pending[..<newline]
+                pending.removeSubrange(...newline)
+                self.processLine(Data(line), on: connection)
+            }
+
+            if error != nil || isComplete {
+                self.connections.removeValue(forKey: key)
+                connection.cancel()
+                return
+            }
+            self.receiveLine(connection, key: key, buffer: pending)
+        }
+    }
+
+    private func processLine(_ data: Data, on connection: NWConnection) {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: String] else {
+            reply(["result": "ERROR", "message": "INVALID_JSON"], to: connection)
+            return
+        }
+        let result = onCommand?(object) ?? "ERROR: NO_HANDLER"
+        reply(["result": result], to: connection)
+    }
+
+    private func reply(_ object: [String: String], to connection: NWConnection) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+        connection.send(content: data + Data([10]), completion: .contentProcessed { _ in })
+    }
+
+    private static func findWiFiIPv4() -> String? {
+        var address: String?
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0, let first = interfaces else { return nil }
+        defer { freeifaddrs(interfaces) }
+        for item in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(item.pointee.ifa_flags)
+            guard (flags & IFF_UP) != 0,
+                  let addr = item.pointee.ifa_addr,
+                  addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let name = String(cString: item.pointee.ifa_name)
+            guard name == "en0" || name == "en1" else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            address = String(cString: host)
+            if name == "en0" { break }
+        }
+        return address
+    }
+}
+
 struct AnalyzerView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var ble = BLEAnalyzer()
+    @StateObject private var bridge = WiFiBLEBridge()
     @State private var hexInput = "55 55"
     @State private var showShare = false
     @State private var exportURL: URL?
@@ -389,12 +618,42 @@ struct AnalyzerView: View {
     var body: some View {
         NavigationStack {
             List {
+                bridgeSection
                 deviceSection
                 servicesSection
                 sendSection
                 logsSection
             }
             .navigationTitle("D11 BLE Analyzer")
+            .onAppear {
+                bridge.onCommand = { command in
+                    let action = command["action"] ?? ""
+                    switch action {
+                    case "write":
+                        guard let uuid = command["uuid"], let hex = command["hex"] else {
+                            return "ERROR: MISSING_UUID_OR_HEX"
+                        }
+                        return ble.bridgeWrite(uuid: uuid, hex: hex)
+                    case "subscribe":
+                        guard let uuid = command["uuid"] else { return "ERROR: MISSING_UUID" }
+                        return ble.bridgeSubscribe(uuid: uuid)
+                    case "read":
+                        guard let uuid = command["uuid"] else { return "ERROR: MISSING_UUID" }
+                        return ble.bridgeRead(uuid: uuid)
+                    case "status":
+                        return ble.isConnected ? "BLE_CONNECTED" : "BLE_DISCONNECTED"
+                    default:
+                        return "ERROR: UNKNOWN_ACTION"
+                    }
+                }
+                bridge.onLog = { direction, message in ble.add(direction, message) }
+            }
+            .onChange(of: scenePhase) { phase in
+                if phase == .background {
+                    bridge.stop()
+                    ble.disconnect(reason: "应用进入后台，自动释放打印机连接")
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: exportLog) {
@@ -412,6 +671,37 @@ struct AnalyzerView: View {
             } message: {
                 Text(alertText)
             }
+        }
+    }
+
+    private var bridgeSection: some View {
+        Section("Windows Wi-Fi 蓝牙桥接") {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(bridge.status).font(.headline)
+                    Text("电脑连接地址：\(bridge.localAddress):8765")
+                        .font(.caption)
+                        .textSelection(.enabled)
+                    Text(bridge.lastClient)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Circle()
+                    .fill(bridge.isRunning ? Color.green : Color.gray)
+                    .frame(width: 10, height: 10)
+            }
+
+            HStack {
+                Button("启动桥接") { bridge.start() }
+                    .disabled(bridge.isRunning)
+                Button("停止桥接") { bridge.stop() }
+                    .disabled(!bridge.isRunning)
+            }
+
+            Text("电脑与 iPhone 必须连接同一 Wi-Fi。桥接只转发本工具支持的 BLE 操作，不会监听官方 APP。不要在不可信的公共 Wi-Fi 上启动。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -441,10 +731,10 @@ struct AnalyzerView: View {
                 }
                 .disabled(!ble.isScanning)
 
-                Button("断开") {
+                Button("断开并释放") {
                     ble.disconnect()
                 }
-                .disabled(!ble.isConnected)
+                .disabled(!ble.isConnected && ble.connectedName == "未连接")
             }
 
             ForEach(ble.devices, id: \.identifier) { device in
